@@ -21,7 +21,9 @@ layers (derived from the checkpoint geometry) are concatenated per token.
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
 import torch
@@ -83,6 +85,31 @@ def resolve_text_encoder_out_layers(
     return tuple(step * i for i in range(1, num_stack + 1))
 
 
+def resolve_tokenizer_subfolder(model_name: str) -> str:
+    """Return the checkpoint subfolder that holds the Qwen3-VL processor files.
+
+    The released ``black-forest-labs/flux-3-image-klein*`` repositories have no
+    ``tokenizer/`` folder: their ``modular_model_index.json`` maps the
+    ``tokenizer`` component to ``text_encoder/``. Converted preview checkpoints
+    ship a separate ``tokenizer/`` folder with a copy of the model config.json,
+    which works around the AutoProcessor+subfolder bug in transformers 4.57.x.
+
+    Args:
+        model_name: Resolved local snapshot dir of the FLUX.3 modular checkpoint.
+
+    Returns:
+        The ``tokenizer`` subfolder recorded in ``modular_model_index.json``, or
+        ``"tokenizer"`` when the index is absent or does not record one.
+    """
+    index_path = Path(model_name) / "modular_model_index.json"
+    if index_path.is_file():
+        # Modular index entries are [library, class_name, loading_spec].
+        entry = json.loads(index_path.read_text()).get("tokenizer")
+        if entry and entry[-1].get("subfolder"):
+            return entry[-1]["subfolder"]
+    return "tokenizer"
+
+
 def load_qwen3vl_text_stack(model_name: str, device: str) -> Flux3TextStack:
     """Load the FLUX.3 Qwen3-VL text stack from a resolved modular snapshot dir.
 
@@ -104,9 +131,7 @@ def load_qwen3vl_text_stack(model_name: str, device: str) -> Flux3TextStack:
     )
     text_encoder = text_encoder.to(device)
     text_encoder.eval()
-    # FLUX.3 repos ship a copy of the model config.json inside tokenizer/ to
-    # work around the AutoProcessor+subfolder bug in transformers 4.57.x.
-    tokenizer = AutoProcessor.from_pretrained(model_name, subfolder="tokenizer")
+    tokenizer = AutoProcessor.from_pretrained(model_name, subfolder=resolve_tokenizer_subfolder(model_name))
 
     # The number of stacked hidden layers is fixed by the transformer's
     # joint_attention_dim; derive it so tiny test checkpoints work too.

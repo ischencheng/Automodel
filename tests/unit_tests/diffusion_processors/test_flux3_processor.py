@@ -20,6 +20,9 @@ import torch
 from nemo_automodel.components.models.flux3.text_encoding import (
     resolve_text_encoder_out_layers as _resolve_text_encoder_out_layers,
 )
+from nemo_automodel.components.models.flux3.text_encoding import (
+    resolve_tokenizer_subfolder,
+)
 from tools.diffusion.processors.flux3 import Flux3Processor
 
 # Layers stacked by the released FLUX.3 checkpoint (Qwen3-VL-4B geometry).
@@ -307,6 +310,40 @@ class TestResolveTextEncoderOutLayers:
     def test_too_shallow_encoder_raises(self):
         with pytest.raises(ValueError, match="only has"):
             _resolve_text_encoder_out_layers(64, 16, 2)
+
+
+# ---------------------------------------------------------------------------
+# Processor subfolder from the modular index
+# ---------------------------------------------------------------------------
+def _write_modular_index(directory, tokenizer_subfolder):
+    """Write a modular_model_index.json shaped like the released FLUX.3 repositories."""
+    import json
+
+    def entry(library, class_name, subfolder):
+        spec = {"pretrained_model_name_or_path": "black-forest-labs/flux-3-image-klein-base", "subfolder": subfolder}
+        return [library, class_name, spec]
+
+    index = {
+        "_class_name": "Flux3ModularPipeline",
+        "text_encoder": entry("transformers", "Qwen3VLForConditionalGeneration", "text_encoder"),
+        "tokenizer": entry("transformers", "Qwen3VLProcessor", tokenizer_subfolder),
+        "transformer": entry("diffusers", "Flux3Transformer2DModel", "transformer"),
+    }
+    (directory / "modular_model_index.json").write_text(json.dumps(index))
+
+
+class TestResolveTokenizerSubfolder:
+    def test_released_checkpoint_keeps_processor_in_text_encoder(self, tmp_path):
+        # The released Klein repositories have no tokenizer/ folder.
+        _write_modular_index(tmp_path, "text_encoder")
+        assert resolve_tokenizer_subfolder(str(tmp_path)) == "text_encoder"
+
+    def test_converted_preview_checkpoint_uses_tokenizer_folder(self, tmp_path):
+        _write_modular_index(tmp_path, "tokenizer")
+        assert resolve_tokenizer_subfolder(str(tmp_path)) == "tokenizer"
+
+    def test_missing_index_defaults_to_tokenizer_folder(self, tmp_path):
+        assert resolve_tokenizer_subfolder(str(tmp_path)) == "tokenizer"
 
 
 # ---------------------------------------------------------------------------
