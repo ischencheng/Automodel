@@ -229,7 +229,20 @@ class QwenImageEditModelParallelizer(ModelParallelizer):
         return super()._apply(model, *args, **kwargs)
 
 
+class Flux3ModelParallelizer(ModelParallelizer):
+    """Checkpoint whole FLUX.3 transformer blocks.
+
+    The default submodule checkpointing wraps children by name, and FLUX.3 blocks name their feedforward ``ff`` and
+    their norm ``norm``, so it would checkpoint only attention.
+    """
+
+    def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
+        """Return True: every FLUX.3 block is checkpointed as a whole."""
+        return True
+
+
 _PARALLELIZERS: dict[str, ModelParallelizer] = {
+    "Flux3Transformer2DModel": Flux3ModelParallelizer(),
     "HunyuanVideo15Transformer3DModel": HunyuanModelParallelizer(),
     "LTX2VideoTransformer3DModel": LTX2ModelParallelizer(),
     "QwenImageTransformer2DModel": QwenImageEditModelParallelizer(),
@@ -237,11 +250,26 @@ _PARALLELIZERS: dict[str, ModelParallelizer] = {
 }
 
 
+# Block lists of Diffusers models with more than one block stack. Structural layer discovery keeps only the longest
+# list, so without these specs activation checkpointing would skip FLUX.3's text, image and reference-image blocks.
+_LAYER_GROUPS: dict[str, dict[str, tuple[str, ...]]] = {
+    "Flux3Transformer2DModel": {
+        "language": ("single_transformer_blocks",),
+        "text_mode": ("txt_mode_blocks",),
+        "image_mode": ("mode_blocks.image",),
+        "image_cond_mode": ("mode_blocks.image_cond",),
+    },
+}
+
+
 def attach_parallelizer(model: nn.Module) -> None:
-    """Attach the adapter-owned sidecar for a supported Diffusers model."""
+    """Attach the adapter-owned sidecar and block-list layout for a supported Diffusers model."""
     parallelizer = _PARALLELIZERS.get(type(model).__name__)
     if parallelizer is not None:
         type(model).parallelizer = parallelizer
+    layer_groups = _LAYER_GROUPS.get(type(model).__name__)
+    if layer_groups is not None:
+        type(model).parallel_layer_groups = layer_groups
 
 
 __all__ = ["attach_parallelizer"]
