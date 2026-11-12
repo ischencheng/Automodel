@@ -61,6 +61,7 @@ from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,
     DSparkForwardOutput,
     build_eval_mask,
+    context_doc_ids,
     create_noise_embed,
     create_position_ids,
     sample_anchor_positions,
@@ -275,6 +276,8 @@ class MiniMaxM3DSparkModel(nn.Module):
     """DSpark draft model with a MiniMax M3 attention backbone (dense, non-causal)."""
 
     _no_split_modules = ["MiniMaxM3DSparkDecoderLayer"]
+    # forward accepts position_ids / seq_lens / doc_remaining for packed rows.
+    supports_sequence_packing = True
 
     def __init__(self, config, released: MiniMaxM3DSparkReleasedConfig | None = None) -> None:
         super().__init__()
@@ -529,15 +532,28 @@ class MiniMaxM3DSparkModel(nn.Module):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
+        """Run one DSpark training forward.
+
+        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
+        ``seq_lens`` ``[B, max_docs]``, ``doc_remaining`` ``[B, S]``) keeps every block
+        inside its anchor's document: the anchor's first target must be in-document,
+        the block's context and supervision stay in that document, and the draft's
+        RoPE uses the per-document positions.
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        packed = seq_lens is not None
 
         anchor_positions, block_keep_mask = sample_anchor_positions(
             seq_len=seq_len,
             loss_mask=loss_mask,
             num_anchors=self.num_anchors,
             device=device,
+            doc_remaining=doc_remaining if packed else None,
         )
         noise_embedding = create_noise_embed(
             self.embed_tokens,
@@ -547,8 +563,17 @@ class MiniMaxM3DSparkModel(nn.Module):
             mask_token_id=self.mask_token_id,
             block_size=self.block_size,
         )
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = create_position_ids(anchor_positions, self.block_size)
+        if packed:
+            context_position_ids = position_ids
+            ctx_doc_id = context_doc_ids(seq_lens, seq_len, device)
+            anchor_doc_id = torch.gather(ctx_doc_id, 1, anchor_positions)
+        else:
+            context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            ctx_doc_id = None
+            anchor_doc_id = None
+        draft_position_ids = create_position_ids(
+            anchor_positions, self.block_size, context_position_ids if packed else None
+        )
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
         sliding_window = None if self.released is None else self.released.sliding_window
         if self.config._attn_implementation == "flex_attention":
@@ -558,6 +583,8 @@ class MiniMaxM3DSparkModel(nn.Module):
                 seq_len,
                 self.block_size,
                 device,
+                ctx_doc_id=ctx_doc_id,
+                anchor_doc_id=anchor_doc_id,
                 sliding_window=sliding_window,
             )
         else:
@@ -568,6 +595,8 @@ class MiniMaxM3DSparkModel(nn.Module):
                 self.block_size,
                 device,
                 noise_embedding.dtype,
+                ctx_doc_id=ctx_doc_id,
+                anchor_doc_id=anchor_doc_id,
                 sliding_window=sliding_window,
             )
         output_hidden = self._forward_backbone(
@@ -618,6 +647,8 @@ class MiniMaxM3DSparkModel(nn.Module):
             label_indices=label_indices,
             safe_label_indices=safe_label_indices,
             block_keep_mask=block_keep_mask,
+            doc_remaining=doc_remaining if packed else None,
+            anchor_positions=anchor_positions if packed else None,
         )
         anchor_token_ids = torch.gather(
             input_ids,

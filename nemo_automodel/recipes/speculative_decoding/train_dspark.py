@@ -67,6 +67,9 @@ from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Conf
 from nemo_automodel.components.models.deepseek_v41.dspark_target import (
     dspark_packed_forward as deepseek_v41_dspark_packed_forward,
 )
+from nemo_automodel.components.models.minimax_m3_vl.dspark_target import (
+    dspark_packed_forward as minimax_m3_dspark_packed_forward,
+)
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.config import (
@@ -719,6 +722,8 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV41ForCausalLM"])
         elif is_minimax_m3_target:
+            # M3's sparse layers select key blocks per document from a boolean document mask.
+            target_packed_forward = minimax_m3_dspark_packed_forward
             # MiniMax M3 VL is a ~400B-parameter MoE VLM: load it frozen through the
             # same expert-parallel / FSDP distributed path the VLM finetune recipe
             # uses, sharding the 128 routed experts across ranks instead of

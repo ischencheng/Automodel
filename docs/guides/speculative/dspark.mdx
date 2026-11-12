@@ -71,7 +71,7 @@ are reduced across data-parallel ranks and written to
 | `markov_rank` / `markov_head_type` | serial head size and variant (`vanilla` / `gated` / `rnn`) |
 | `confidence_head_alpha` / `confidence_head_with_markov` | confidence-head weight and conditioning |
 | `confidence_head_stop_gradient` | DeepSeek V4.1 only: train the confidence head on detached inputs so its loss cannot back-propagate into the draft backbone (default `false`) |
-| `packed_sequence_size` | packs documents into rows of this many tokens when greater than 0 (Qwen3, DeepSeek V4, and DeepSeek V4.1 targets; online text-only data with `cp_size: 1` and `target_model_backend: colocated`) |
+| `packed_sequence_size` | packs documents into rows of this many tokens when greater than 0 (Qwen3, DeepSeek V4, DeepSeek V4.1, MiniMax M3, and MiniMax M3.1 Flash targets; online text-only data with `cp_size: 1` and `target_model_backend: colocated`) |
 
 ## DeepSeek V4.1 Flash
 
@@ -170,6 +170,13 @@ LM head, so the draft relies on the target's. MiniMax M3 has no `dspark/` folder
 so its drafts keep native keys and take the FFN width from `intermediate_size`. A
 local M3.1 snapshot needs its `dspark/` folder too; without it the recipe logs a
 warning and builds that same draft.
+
+Sequence packing (`packed_sequence_size`) works for MiniMax M3 and M3.1 Flash.
+The frozen target gets a document mask with per-document positions, and its sparse
+layers pick key blocks inside each document, so each document's features match a
+forward on that document alone. The draft keeps every block, and its sliding window,
+inside the anchor's document. Packed rows keep their width, so every rank sends the
+same token count to HybridEP.
 
 Supported targets include Qwen3 (dense and MoE), Gemma4, DeepSeek V4 and V4.1,
 GLM-5.2, Kimi K3, MiniMax M3, and MiniMax M3.1 Flash.

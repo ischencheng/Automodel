@@ -75,7 +75,9 @@ class _DSparkPackedForward(Protocol):
     as compressed KV or sparse indexers, run packed rows through their own metadata instead.
     """
 
-    def __call__(self, model: nn.Module, input_ids: torch.Tensor, *, seq_lens: torch.Tensor) -> _PackedActivationLayout:
+    def __call__(
+        self, model: nn.Module, input_ids: torch.Tensor, *, seq_lens: torch.Tensor
+    ) -> _PackedActivationLayout | None:
         """Run the frozen forward on packed rows.
 
         Args:
@@ -86,7 +88,7 @@ class _DSparkPackedForward(Protocol):
 
         Returns:
             The layout that maps activations captured during the forward back to
-            [batch, sequence].
+            [batch, sequence], or None when the forward keeps the rows' layout.
         """
 
 
