@@ -30,12 +30,14 @@ no MTP).  Mirrors the canonical sglang reference
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.weak import WeakIdKeyDictionary
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -166,6 +168,7 @@ def _select_sparse_blocks_chunk(
     init_blocks: int,
     local_blocks: int,
     score_type: str,
+    q_first_blocks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select key blocks for one local query chunk using FP32 scores.
 
@@ -178,6 +181,8 @@ def _select_sparse_blocks_chunk(
         init_blocks: Number of initial blocks always selected.
         local_blocks: Number of recent blocks always selected.
         score_type: Block score reduction, max or log-sum-exp.
+        q_first_blocks: Optional integer tensor of shape [queries] with the first
+            block each query may select; init blocks count from it. None means 0.
 
     Returns:
         Boolean selection mask [batch, index_heads, queries, key_blocks].
@@ -212,7 +217,14 @@ def _select_sparse_blocks_chunk(
     cur_block = q_positions // block_size  # [Tq]
     valid_blocks = cur_block + 1  # causal: blocks [0, valid_blocks)
     causal_block = blk[None, :] < valid_blocks[:, None]  # [Tq, num_blocks]
-    forced = ((blk[None, :] == cur_block[:, None]) & (local_blocks > 0)) | (blk[None, :] < init_blocks)
+    if q_first_blocks is None:
+        init_limit = blk[None, :] < init_blocks
+    else:
+        # A packed document's blocks start at its own first block: nothing before it is
+        # a candidate, and its init blocks are counted from there.
+        causal_block = causal_block & (blk[None, :] >= q_first_blocks[:, None])
+        init_limit = blk[None, :] < (q_first_blocks + init_blocks)[:, None]
+    forced = ((blk[None, :] == cur_block[:, None]) & (local_blocks > 0)) | init_limit
     forced = forced & causal_block
 
     sel = block_score.masked_fill(~causal_block[None, None], neg_inf)
@@ -236,6 +248,7 @@ def select_sparse_blocks(
     local_blocks: int,
     score_type: str = "max",
     q_positions: torch.Tensor | None = None,
+    q_first_blocks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select, per query, which key blocks to attend to (DSA block top-k).
 
@@ -261,6 +274,9 @@ def select_sparse_blocks(
         idx_k: ``[B, Tk, 1, D]`` shared index key (post norm + RoPE).
         q_positions: ``[Tq]`` long global position of each query; defaults to
             ``arange(Tq)`` (the eager square case).
+        q_first_blocks: Optional ``[Tq]`` long first block each query may select,
+            with ``init_blocks`` counted from it (see
+            :func:`select_document_sparse_blocks`); None means block 0.
 
     Returns:
         ``[B, H_idx, Tq, num_blocks]`` bool block-selection mask (causal +
@@ -272,6 +288,8 @@ def select_sparse_blocks(
     if q_positions is None:
         q_positions = torch.arange(tq, device=device)
     q_positions = q_positions.to(device=device, dtype=torch.long)
+    if q_first_blocks is not None:
+        q_first_blocks = q_first_blocks.to(device=device, dtype=torch.long)
 
     kwargs = dict(
         block_size=block_size,
@@ -284,13 +302,200 @@ def select_sparse_blocks(
     bytes_per_query = max(1, bsz * h_idx * tk * 4)
     q_chunk = max(1, min(tq, _SELECT_SCORE_BUDGET_BYTES // bytes_per_query))
     if q_chunk >= tq:
-        return _select_sparse_blocks_chunk(idx_q, idx_k, q_positions, **kwargs)
+        return _select_sparse_blocks_chunk(idx_q, idx_k, q_positions, q_first_blocks=q_first_blocks, **kwargs)
 
     chunks = [
-        _select_sparse_blocks_chunk(idx_q[:, s : s + q_chunk], idx_k, q_positions[s : s + q_chunk], **kwargs)
+        _select_sparse_blocks_chunk(
+            idx_q[:, s : s + q_chunk],
+            idx_k,
+            q_positions[s : s + q_chunk],
+            q_first_blocks=None if q_first_blocks is None else q_first_blocks[s : s + q_chunk],
+            **kwargs,
+        )
         for s in range(0, tq, q_chunk)
     ]
     return torch.cat(chunks, dim=2)  # concat along Tq
+
+
+@dataclass(frozen=True)
+class SparseDocumentLayout:
+    """Where the keys of packed documents sit in a block-aligned selection workspace.
+
+    MSA lays every packed document out from a ``block_size`` boundary, so no key block
+    holds two documents and a document selects the same blocks as when it runs alone.
+    The generic path selects over the same layout.
+
+    Attributes:
+        key_rows: Long tensor of shape [batch, keys], the workspace row of every key; a
+            batch of 1 is shared by every row.
+        first_blocks: Long tensor of shape [batch, keys], the first workspace block of
+            each token's document.
+        block_size: Keys per block.
+        num_blocks: Workspace blocks per batch row, set by the widest row.
+    """
+
+    key_rows: torch.Tensor
+    first_blocks: torch.Tensor
+    block_size: int
+    num_blocks: int
+
+    @property
+    def key_blocks(self) -> torch.Tensor:
+        """Long tensor of shape [batch, keys], the workspace block of every key."""
+        return self.key_rows // self.block_size
+
+
+_DOCUMENT_LAYOUTS: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+
+@torch.no_grad()
+def sparse_document_layout(
+    position_ids: torch.Tensor | None,
+    *,
+    block_size: int,
+    padding_mask: torch.Tensor | None = None,
+    memo_key: torch.Tensor | None = None,
+) -> SparseDocumentLayout | None:
+    """Lay out the packed documents of a batch, found where ``position_ids`` resets to 0.
+
+    Padding tokens and repeated zeros (collators pad ``position_ids`` with 0) do not open
+    a document; they stay in the document before them, where causality and the caller's
+    mask already hide them. The result is memoized on the ``position_ids`` tensor, which
+    every layer of a forward and its recompute share; building it reads the workspace
+    size back to the host once.
+
+    Args:
+        position_ids: Long tensor of shape [batch, keys], [keys], or [3, batch, keys]
+            (mRoPE, axis 0 is the text axis), in key order. A batch of 1 is shared by
+            every row.
+        block_size: Keys per selection block.
+        padding_mask: Optional bool tensor of shape [batch, keys], True for padding.
+        memo_key: Tensor whose identity keys the memo when ``position_ids`` is rebuilt
+            per layer (the gathered context-parallel ids); defaults to ``position_ids``.
+
+    Returns:
+        The layout, or None when every row holds one document, so unpacked batches keep
+        the row layout unchanged.
+    """
+    if position_ids is None:
+        return None
+    memo_key = position_ids if memo_key is None else memo_key
+    cached = _DOCUMENT_LAYOUTS.get(memo_key)
+    if cached is not None and block_size in cached:
+        return cached[block_size]
+    positions = position_ids[0] if position_ids.dim() == 3 else position_ids
+    if positions.dim() == 1:
+        positions = positions.unsqueeze(0)
+    positions = positions.to(torch.long)
+    length = positions.shape[-1]
+    slots = torch.arange(length, device=positions.device)
+    starts = positions == 0
+    starts[:, 1:] &= positions[:, :-1] != 0
+    if padding_mask is not None:
+        starts = starts & ~padding_mask.to(device=positions.device, dtype=torch.bool).reshape(-1, length)
+    starts[:, 0] = True
+    start_slots = torch.where(starts, slots, 0).cummax(dim=-1).values
+    previous_starts = torch.cat([start_slots[:, :1], start_slots[:, :-1]], dim=-1)
+    # A document ending off a block boundary leaves the rest of its last block empty.
+    gaps = torch.where(starts, (previous_starts - slots) % block_size, 0)
+    key_rows = slots + gaps.cumsum(dim=-1)
+    first_blocks = (key_rows - (slots - start_slots)) // block_size
+    documents, last_row = torch.stack([starts.sum(dim=-1).amax(), key_rows[:, -1].amax()]).tolist()
+    layout = None
+    if documents > 1:
+        layout = SparseDocumentLayout(
+            key_rows=key_rows,
+            first_blocks=first_blocks,
+            block_size=block_size,
+            num_blocks=last_row // block_size + 1,
+        )
+    _DOCUMENT_LAYOUTS.setdefault(memo_key, {})[block_size] = layout
+    return layout
+
+
+def packed_sparse_documents(
+    attention_mask: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    *,
+    block_size: int,
+) -> SparseDocumentLayout | None:
+    """Return the document layout of a packed local batch, or None for an unpacked one.
+
+    Without context parallelism, packed batches reach M3 as a 4-D document keep-mask
+    plus per-document ``position_ids``; any other mask means one document per row.
+
+    Args:
+        attention_mask: Caller mask; only a 4-D mask marks a packed batch.
+        position_ids: Position ids, reset to 0 at each document start.
+        padding_mask: Optional bool tensor of shape [batch, keys], True for padding.
+        block_size: Keys per selection block.
+
+    Returns:
+        The layout from :func:`sparse_document_layout`, or None.
+    """
+    if attention_mask is None or attention_mask.dim() != 4:
+        return None
+    return sparse_document_layout(position_ids, block_size=block_size, padding_mask=padding_mask)
+
+
+@torch.no_grad()
+def select_document_sparse_blocks(
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    *,
+    layout: SparseDocumentLayout,
+    topk_blocks: int,
+    init_blocks: int,
+    local_blocks: int,
+    score_type: str = "max",
+    q_slots: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Select key blocks inside each query's own packed document.
+
+    Every document's keys are scattered to its rows of the block-aligned workspace and
+    each query ranks only the blocks of its document up to its own, with the init blocks
+    counted from the document's first block. This is MSA's document-local rule, so the
+    selection equals that of the document run alone.
+
+    Args:
+        idx_q: Tensor of shape [batch, queries, index_heads, head_dim], post norm and RoPE.
+        idx_k: Tensor of shape [batch, keys, 1, head_dim], post norm and RoPE.
+        layout: Workspace of the keys, from :func:`sparse_document_layout`.
+        topk_blocks: Blocks each query keeps.
+        init_blocks: Leading blocks of each document always kept.
+        local_blocks: Non-zero always keeps the query's own block.
+        score_type: Block score reduction, ``"max"`` or ``"lse"``.
+        q_slots: Optional long tensor of shape [queries], the key index of each query;
+            defaults to ``arange(queries)``.
+
+    Returns:
+        Bool tensor of shape [batch, index_heads, queries, layout.num_blocks]; key ``j``
+        of row ``b`` lies in workspace block ``layout.key_blocks[b, j]``.
+    """
+    bsz, tq = idx_q.shape[:2]
+    if q_slots is None:
+        q_slots = torch.arange(tq, device=idx_q.device)
+    rows = layout.num_blocks * layout.block_size
+    selections = []
+    for b in range(bsz):
+        row = b if layout.key_rows.shape[0] > 1 else 0
+        key_rows = layout.key_rows[row]
+        keys = idx_k.new_zeros((1, rows, *idx_k.shape[2:])).index_copy_(1, key_rows, idx_k[b : b + 1])
+        selections.append(
+            select_sparse_blocks(
+                idx_q[b : b + 1],
+                keys,
+                block_size=layout.block_size,
+                topk_blocks=topk_blocks,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                score_type=score_type,
+                q_positions=key_rows.index_select(0, q_slots),
+                q_first_blocks=layout.first_blocks[row].index_select(0, q_slots),
+            )
+        )
+    return torch.cat(selections, dim=0)
 
 
 @torch.no_grad()
@@ -304,6 +509,7 @@ def build_block_sparse_attn_mask(
     local_blocks: int,
     num_q_heads: int,
     score_type: str = "max",
+    documents: SparseDocumentLayout | None = None,
 ) -> torch.Tensor:
     """Build the boolean ``[B, num_q_heads, T, T]`` block-sparse causal keep-mask.
 
@@ -323,9 +529,27 @@ def build_block_sparse_attn_mask(
         idx_k: ``[B, T, 1, D]`` shared index key (post norm + RoPE).
         num_q_heads: number of main attention heads; the per-idx-head mask is
             expanded ``num_q_heads // H_idx`` times (GQA, repeat-interleave).
+        documents: Optional layout of packed documents; each query then selects
+            blocks of its own document only (:func:`select_document_sparse_blocks`).
     """
     bsz, seqlen, h_idx, dim = idx_q.shape
     device = idx_q.device
+    causal = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=device))
+    rep = num_q_heads // h_idx
+
+    if documents is not None:
+        block_sel = select_document_sparse_blocks(
+            idx_q,
+            idx_k,
+            layout=documents,
+            topk_blocks=topk_blocks,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            score_type=score_type,
+        )  # [B, H_idx, T, workspace_blocks]
+        key_blocks = documents.key_blocks[:, None, None, :].expand(bsz, h_idx, seqlen, seqlen)
+        key_sel = block_sel.gather(-1, key_blocks) & causal[None, None]
+        return key_sel.repeat_interleave(rep, dim=1)
 
     block_sel = select_sparse_blocks(
         idx_q,
@@ -337,11 +561,8 @@ def build_block_sparse_attn_mask(
         score_type=score_type,
     )  # [B, H_idx, T, num_blocks]
 
-    causal = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=device))
     key_sel = block_sel.repeat_interleave(block_size, dim=-1)[..., :seqlen]  # [B, H_idx, Tq, Tk]
     key_sel = key_sel & causal[None, None]
-
-    rep = num_q_heads // h_idx
     return key_sel.repeat_interleave(rep, dim=1)  # [B, num_q_heads, Tq, Tk] bool (True == attend)
 
 
@@ -426,10 +647,17 @@ class MiniMaxM3Indexer(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, *, freqs_cis: torch.Tensor, num_q_heads: int, **attn_kwargs: Any
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        num_q_heads: int,
+        documents: SparseDocumentLayout | None = None,
+        **attn_kwargs: Any,
     ) -> torch.Tensor:
         """Map x[batch, sequence, hidden] and freqs_cis[batch, sequence, rotary] to a bool keep-mask
-        [batch, num_q_heads, sequence, sequence]."""
+        [batch, num_q_heads, sequence, sequence]; with ``documents``, blocks are selected per packed
+        document."""
         idx_q, idx_k = self.project_qk(
             x,
             freqs_cis=freqs_cis,
@@ -445,6 +673,7 @@ class MiniMaxM3Indexer(nn.Module):
             local_blocks=self.local_blocks,
             num_q_heads=num_q_heads,
             score_type=self.score_type,
+            documents=documents,
         )
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
@@ -567,8 +796,13 @@ class MiniMaxM3Attention(nn.Module):
         # padding_mask / position_ids are only consumed by the CP-aware sparse
         # subclass; drop them here so they never reach the indexer or the attention
         # backend kwargs (eager path uses freqs_cis, not raw position_ids).
-        attn_kwargs.pop("padding_mask", None)
-        attn_kwargs.pop("position_ids", None)
+        padding_mask = attn_kwargs.pop("padding_mask", None)
+        position_ids = attn_kwargs.pop("position_ids", None)
+        documents = None
+        if self.indexer is not None and msa is None:
+            documents = packed_sparse_documents(
+                attention_mask, position_ids, padding_mask, block_size=self.indexer.block_size
+            )
         if msa is not None:
             x, freqs_cis = msa.pack(x), msa.pack(freqs_cis)
         qkv_format = "thd" if x.dim() == 2 else "bshd"
@@ -577,7 +811,9 @@ class MiniMaxM3Attention(nn.Module):
         if self.indexer is not None:
             if qkv_format != "bshd":
                 raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
-            sparse_keep = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+            sparse_keep = self.indexer(
+                x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, documents=documents, **attn_kwargs
+            )
             # Preserve the caller's padding mask: padded keys must stay masked
             # rather than becoming eligible for top-k block selection. Boolean AND
             # (not additive) so SDPA is bf16-safe -- see build_block_sparse_attn_mask.

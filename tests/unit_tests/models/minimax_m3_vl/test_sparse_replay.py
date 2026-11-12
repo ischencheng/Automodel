@@ -123,6 +123,7 @@ def _cpu_attention(
     q_positions: torch.Tensor,
     keep_mask: torch.Tensor | None,
     rescue_pad_queries: bool,
+    key_blocks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CPU SDPA substitute for the CUDA kernel, retaining all trainable paths.
 
@@ -134,6 +135,7 @@ def _cpu_attention(
         q_positions: Query token slots [sequence].
         keep_mask: Optional caller keep mask [batch, heads, sequence, sequence].
         rescue_pad_queries: Local path must pass False.
+        key_blocks: Optional selection block of every key [batch, sequence] for packed documents.
 
     Returns:
         Attention values [batch, sequence, query_heads, head_dim].
@@ -141,7 +143,10 @@ def _cpu_attention(
     assert not rescue_pad_queries
     length = k.shape[1]
     keys = torch.arange(length, device=q.device)
-    mask = block_sel[..., keys // self.indexer.block_size]
+    if key_blocks is None:
+        mask = block_sel[..., keys // self.indexer.block_size]
+    else:
+        mask = block_sel.gather(-1, key_blocks[:, None, None, :].expand(*block_sel.shape[:3], length))
     mask = mask.repeat_interleave(self.num_heads // self.indexer.num_index_heads, dim=1)
     mask = mask & (keys[None, :] <= q_positions[:, None])
     if keep_mask is not None:

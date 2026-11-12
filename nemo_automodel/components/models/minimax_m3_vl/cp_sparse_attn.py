@@ -40,7 +40,14 @@ from torch.autograd import Function
 from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
-from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention, select_sparse_blocks
+from nemo_automodel.components.models.minimax_m3_vl.layers import (
+    MiniMaxM3Attention,
+    SparseDocumentLayout,
+    packed_sparse_documents,
+    select_document_sparse_blocks,
+    select_sparse_blocks,
+    sparse_document_layout,
+)
 from nemo_automodel.components.models.minimax_m3_vl.recompute import sparse_route_replay
 
 # Compiled FlexAttention is built lazily (and cached) on first use so that
@@ -368,7 +375,15 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
                 and self.indexer.block_size == 128
                 and self.head_dim in (64, 128, 256)
             ):
-                return self._local_sparse_forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
+                documents = packed_sparse_documents(
+                    attention_mask,
+                    attn_kwargs.get("position_ids", None),
+                    attn_kwargs.get("padding_mask", None),
+                    block_size=self.indexer.block_size,
+                )
+                return self._local_sparse_forward(
+                    x, freqs_cis=freqs_cis, attention_mask=attention_mask, documents=documents
+                )
             if self.indexer is not None and self.backend.attn == "fa4":
                 raise NotImplementedError(
                     "MiniMax M3 local FA4 sparse attention requires CUDA FP16/BF16, "
@@ -385,17 +400,20 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None,
+        documents: SparseDocumentLayout | None = None,
     ) -> torch.Tensor:
         """Run local BSHD sparse attention without a ``[batch, heads, sequence, sequence]`` mask.
 
-        Block selection is unchanged. The optional caller keep-mask is composed inside
-        FlexAttention, including packed document masks and completely masked padding rows.
+        The optional caller keep-mask is composed inside FlexAttention, including packed
+        document masks and completely masked padding rows. With ``documents``, every query
+        selects blocks of its own packed document only.
 
         Args:
             x: Hidden states [batch, sequence, hidden].
             freqs_cis: Non-fused rotary cos/sin table [batch, sequence, rotary_dim].
             attention_mask: Optional [batch, sequence] padding keep-mask or boolean
                 mask broadcastable to [batch, heads, sequence, sequence].
+            documents: Optional layout of the packed documents in the batch.
 
         Returns:
             Attention output [batch, sequence, hidden], with zero output for fully
@@ -417,7 +435,7 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         q, k, v = self._project_qkv(x)
         q, k = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=self.backend.rope_fusion)
         q_positions = torch.arange(x.shape[1], device=x.device)
-        block_sel = self._select_local_blocks(x, freqs_cis=freqs_cis, q_positions=q_positions)
+        block_sel = self._select_local_blocks(x, freqs_cis=freqs_cis, q_positions=q_positions, documents=documents)
         out = self._flex_sparse_attention(
             q,
             k,
@@ -426,6 +444,7 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
             q_positions=q_positions,
             keep_mask=attention_mask,
             rescue_pad_queries=False,
+            key_blocks=None if documents is None else documents.key_blocks.expand(x.shape[0], -1),
         )
         return self.o_proj(out.flatten(2))
 
@@ -435,6 +454,7 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         *,
         freqs_cis: torch.Tensor,
         q_positions: torch.Tensor,
+        documents: SparseDocumentLayout | None = None,
     ) -> torch.Tensor:
         """Select key blocks once per checkpointed local attention call.
 
@@ -447,11 +467,13 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
             x: Hidden states [batch, sequence, hidden].
             freqs_cis: Rotary cosine/sine table [batch, sequence, rotary_dim].
             q_positions: Global token slots [sequence] for the local sequence.
+            documents: Optional layout of the packed documents in the batch.
 
         Returns:
             Boolean selected blocks [batch, index_heads, sequence, key_blocks],
-            where key_blocks is ceil(sequence / block_size). A replay aliases
-            the original selection, which callers must treat as read-only.
+            where key_blocks is ceil(sequence / block_size), or the workspace
+            block count of ``documents``. A replay aliases the original
+            selection, which callers must treat as read-only.
         """
         replay = sparse_route_replay.current()
         if replay is not None and replay[1] == "replay":
@@ -461,16 +483,28 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
 
         with torch.no_grad(), _disable_current_modes():
             index_q, index_k = self.indexer.project_qk(x, freqs_cis=freqs_cis, cp_size=1, cp_rank=0)
-            block_sel = select_sparse_blocks(
-                index_q,
-                index_k,
-                block_size=self.indexer.block_size,
-                topk_blocks=self.indexer.topk_blocks,
-                init_blocks=self.indexer.init_blocks,
-                local_blocks=self.indexer.local_blocks,
-                score_type=self.indexer.score_type,
-                q_positions=q_positions,
-            )
+            if documents is not None:
+                block_sel = select_document_sparse_blocks(
+                    index_q,
+                    index_k,
+                    layout=documents,
+                    topk_blocks=self.indexer.topk_blocks,
+                    init_blocks=self.indexer.init_blocks,
+                    local_blocks=self.indexer.local_blocks,
+                    score_type=self.indexer.score_type,
+                    q_slots=q_positions,
+                )
+            else:
+                block_sel = select_sparse_blocks(
+                    index_q,
+                    index_k,
+                    block_size=self.indexer.block_size,
+                    topk_blocks=self.indexer.topk_blocks,
+                    init_blocks=self.indexer.init_blocks,
+                    local_blocks=self.indexer.local_blocks,
+                    score_type=self.indexer.score_type,
+                    q_positions=q_positions,
+                )
         if replay is not None and replay[1] == "record":
             replay[0].record(block_sel)
         return block_sel
@@ -527,6 +561,7 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         position_ids = attn_kwargs.get("position_ids", None)
         doc_global = None  # [B, T_global] long: document id per global key slot
         q_doc = None  # [B, t_local] long: document id per local query
+        documents = None  # block-aligned workspace of a packed sequence
         if position_ids is not None:
             # M3 text uses 1-D [B, S] position ids. The 3-D branch is defensive for an
             # mRoPE [3, B, S] layout (Qwen2-VL convention: axis 0 is the temporal/text
@@ -543,6 +578,14 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
             pos_global = _all_gather_concat_nograd(local_pos.long(), cp_group, dim=1).index_select(1, sort_order)
             doc_global = cp_document_ids(pos_global)  # [B, T_global]
             q_doc = doc_global.index_select(1, q_slots)  # [B, t_local]
+            # Select inside each document, as MSA and a lone document do. Memoized on the
+            # local ids, which every layer of this forward shares.
+            documents = sparse_document_layout(
+                pos_global,
+                block_size=self.indexer.block_size,
+                padding_mask=None if key_valid is None else ~key_valid,
+                memo_key=position_ids,
+            )
 
         # 3. block selection: local queries vs the global key sequence (no grad).
         with torch.no_grad():
@@ -555,16 +598,28 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
                 idx_q, idx_k, freqs_cis, format="bshd", rope_fusion=idxer.backend.rope_fusion
             )
             idx_k_g = _all_gather_concat_nograd(idx_k, cp_group, dim=1).index_select(1, sort_order)  # [B,T_global,1,D]
-            block_sel = select_sparse_blocks(
-                idx_q,
-                idx_k_g,
-                block_size=idxer.block_size,
-                topk_blocks=idxer.topk_blocks,
-                init_blocks=idxer.init_blocks,
-                local_blocks=idxer.local_blocks,
-                score_type=idxer.score_type,
-                q_positions=q_slots,
-            )  # [B, H_idx, T_local, num_blocks]
+            if documents is not None:
+                block_sel = select_document_sparse_blocks(
+                    idx_q,
+                    idx_k_g,
+                    layout=documents,
+                    topk_blocks=idxer.topk_blocks,
+                    init_blocks=idxer.init_blocks,
+                    local_blocks=idxer.local_blocks,
+                    score_type=idxer.score_type,
+                    q_slots=q_slots,
+                )  # [B, H_idx, T_local, workspace_blocks]
+            else:
+                block_sel = select_sparse_blocks(
+                    idx_q,
+                    idx_k_g,
+                    block_size=idxer.block_size,
+                    topk_blocks=idxer.topk_blocks,
+                    init_blocks=idxer.init_blocks,
+                    local_blocks=idxer.local_blocks,
+                    score_type=idxer.score_type,
+                    q_positions=q_slots,
+                )  # [B, H_idx, T_local, num_blocks]
 
         # 4. FlexAttention over the block-sparse mask (local queries x global K/V).
         out = self._flex_sparse_attention(
@@ -576,6 +631,7 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
             key_valid=key_valid,
             doc_global=doc_global,
             q_doc=q_doc,
+            key_blocks=None if documents is None else documents.key_blocks.expand(bsz, -1),
         )
         return self.o_proj(out.flatten(2))
 
@@ -592,6 +648,7 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         q_doc: torch.Tensor | None = None,
         keep_mask: torch.Tensor | None = None,
         rescue_pad_queries: bool = True,
+        key_blocks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from torch.nn.attention.flex_attention import create_block_mask
 
@@ -642,9 +699,9 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
                 b = b // self.num_kv_heads
             else:
                 h_idx = h // rep
-            sel_offset = _block_sel_flat_offset(
-                b, h_idx, q_idx, kv_idx // block_size, sel_heads, sel_queries, sel_blocks
-            )
+            # Packed documents select over a block-aligned workspace (key_blocks [B, T_kv]).
+            kv_block = kv_idx // block_size if key_blocks is None else key_blocks[b, kv_idx]
+            sel_offset = _block_sel_flat_offset(b, h_idx, q_idx, kv_block, sel_heads, sel_queries, sel_blocks)
             keep = (kv_idx <= q_positions[q_idx]) & block_sel_flat[sel_offset]
             if key_valid is not None:
                 keep = keep & key_valid[b, kv_idx]

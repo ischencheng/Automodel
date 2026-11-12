@@ -197,11 +197,53 @@ def main():
     else:
         rc = 0
 
+    rc = max(rc, _check_packed_documents(attn, text, x_full, cp_mesh, rank, cp_size, device))
     rc_t = torch.tensor(rc, device=device)
     dist.all_reduce(rc_t, op=dist.ReduceOp.MAX)
     dist.barrier()
     dist.destroy_process_group()
     sys.exit(int(rc_t.item()))
+
+
+def _check_packed_documents(attn, text, x_full, cp_mesh, rank, cp_size, device):
+    """Shard a packed row (per-document position ids) and compare each document with it alone.
+
+    Returns:
+        0 on rank 0 when every document matches, 1 when one does not; 0 on other ranks.
+    """
+    from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import cp_load_balanced_global_slots
+
+    seqlen = x_full.shape[1]
+    t_local = seqlen // cp_size
+    # Uneven documents that start mid-block, so the row and document block partitions differ.
+    lengths = [seqlen // 4 + 44, seqlen // 2 + 5]
+    lengths.append(seqlen - sum(lengths))
+    positions = torch.cat([torch.arange(n, device=device) for n in lengths])[None]
+    with torch.no_grad():
+        attn._cp_mesh = cp_mesh
+        slots = cp_load_balanced_global_slots(cp_size, t_local, device, rank=rank)
+        local_positions = positions.index_select(1, slots)
+        local = attn._cp_forward(
+            x_full.index_select(1, slots).contiguous(),
+            freqs_cis=text.make_freqs_cis(local_positions),
+            position_ids=local_positions,
+        )
+        gathered = [torch.zeros_like(local) for _ in range(cp_size)]
+        dist.all_gather(gathered, local.contiguous())
+        packed = torch.empty_like(x_full[..., : local.shape[-1]])
+        packed[:, cp_load_balanced_global_slots(cp_size, t_local, device), :] = torch.cat(gathered, dim=1)
+        attn._cp_mesh = None
+        if rank != 0:
+            return 0
+        worst, start = 0.0, 0
+        for n in lengths:
+            doc_positions = torch.arange(n, device=device)[None]
+            alone = attn(x_full[:, start : start + n], freqs_cis=text.make_freqs_cis(doc_positions))
+            worst = max(worst, (packed[:, start : start + n] - alone).float().abs().max().item())
+            start += n
+    ok = worst < (5e-2 if packed.dtype == torch.bfloat16 else 1e-4)
+    print(f"packed documents {lengths}: max_abs vs each document alone={worst:.3e} ->", "PASS" if ok else "FAIL")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
