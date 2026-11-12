@@ -20,7 +20,7 @@ also what MSA's document-local rule gives.
 
 import pytest
 import torch
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
 import nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn as cp
 from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
@@ -112,8 +112,14 @@ def _cpu_packed_forward(
     return self._local_sparse_forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, documents=documents)
 
 
-def test_checkpoint_recompute_replays_document_selection(monkeypatch):
-    """Activation checkpointing replays the per-document selection and matches gradients."""
+@pytest.mark.parametrize("selective", [False, True])
+def test_checkpoint_recompute_replays_document_selection(monkeypatch, selective):
+    """Activation checkpointing replays the per-document selection and matches gradients.
+
+    The checkpointed call is the first to see its position ids, so it builds the layout inside
+    the checkpointed region and its recompute finds the memo; the selective variant saves
+    matmuls as a selective policy would.
+    """
     monkeypatch.setattr(MiniMaxM3CPSparseAttention, "forward", _cpu_packed_forward)
     monkeypatch.setattr(MiniMaxM3CPSparseAttention, "_flex_sparse_attention", _cpu_attention)
     calls = []
@@ -132,10 +138,24 @@ def test_checkpoint_recompute_replays_document_selection(monkeypatch):
     freqs = torch.cat((angles.cos(), angles.sin()), -1).unsqueeze(0)
     x = torch.randn(1, sum(lengths), 32, requires_grad=True)
     xr = x.detach().clone().requires_grad_()
-    kwargs = dict(freqs_cis=freqs, attention_mask=keep, position_ids=positions)
-    expected = block(xr, **kwargs)
+    expected = block(xr, freqs_cis=freqs, attention_mask=keep, position_ids=positions.clone())
     assert len(calls) == 1
-    actual = checkpoint(block, x, use_reentrant=False, context_fn=block.nemo_checkpoint_context_fn(None), **kwargs)
+
+    def policy(ctx, op, *args, **kwargs):
+        if op in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    inner = (lambda: create_selective_checkpoint_contexts(policy)) if selective else None
+    actual = checkpoint(
+        block,
+        x,
+        use_reentrant=False,
+        context_fn=block.nemo_checkpoint_context_fn(inner),
+        freqs_cis=freqs,
+        attention_mask=keep,
+        position_ids=positions.clone(),
+    )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     weight = torch.randn_like(actual)
     (actual * weight).sum().backward()
