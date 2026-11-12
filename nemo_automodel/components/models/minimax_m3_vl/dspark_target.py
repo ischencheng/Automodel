@@ -27,8 +27,8 @@ def dspark_packed_forward(model: nn.Module, input_ids: torch.Tensor, *, seq_lens
 
     M3 takes packed documents as a boolean ``[batch, 1, sequence, sequence]`` document
     keep-mask with per-document ``position_ids``; its sparse layers then select key
-    blocks inside each document. The rows keep their layout, and only the last
-    position's logits are projected since DSpark reads hooked activations.
+    blocks inside each document. The rows keep their layout, and ``logits_to_keep``
+    skips the LM head since DSpark reads hooked activations.
 
     Args:
         model: ``MiniMaxM3SparseForConditionalGeneration`` target.

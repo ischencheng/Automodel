@@ -661,8 +661,8 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         load_metadata_with_gloo = read_load_metadata_with_gloo(self.cfg.get("checkpoint", None))
 
-        # V4 and V4.1 isolate packed documents through their own packing metadata
-        # instead of the generic block-causal mask.
+        # V4, V4.1 and MiniMax M3 isolate packed documents through their own packing
+        # metadata instead of the generic additive block-causal mask.
         target_packed_forward = None
         if is_deepseek_v4_target:
             target_packed_forward = deepseek_v4_dspark_packed_forward

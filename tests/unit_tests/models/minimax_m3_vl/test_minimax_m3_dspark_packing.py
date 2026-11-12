@@ -80,6 +80,41 @@ def test_packed_target_features_match_each_document_alone(vlm_model):
             )
 
 
+def test_packed_target_ignores_trailing_padding(vlm_model):
+    """Trailing padding folded into the last document, as the packed loader emits it, leaves real tokens unchanged."""
+    wrapper = HFDSparkTargetModel(
+        vlm_model, target_layer_ids=[0, 2], packed_forward=dspark_target.dspark_packed_forward
+    )
+    lengths, pad = [13, 22, 9], 4
+    generator = torch.Generator().manual_seed(2)
+    documents = [torch.randint(1, 100, (1, n), generator=generator) for n in lengths]
+    input_ids = torch.cat([*documents, torch.zeros(1, pad, dtype=torch.long)], dim=1)
+    position_ids = torch.cat([torch.arange(n) for n in lengths[:-1]] + [torch.arange(lengths[-1] + pad)])[None]
+    doc_remaining = torch.cat([torch.arange(n - 1, -1, -1) for n in lengths] + [torch.zeros(pad, dtype=torch.long)])[
+        None
+    ]
+    seq_lens = torch.tensor([lengths[:-1] + [lengths[-1] + pad]])
+    attention_mask = torch.ones_like(input_ids)
+    attention_mask[:, -pad:] = 0
+    with torch.no_grad():
+        packed = wrapper.generate_batch(
+            input_ids,
+            attention_mask,
+            attention_mask,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
+            doc_remaining=doc_remaining,
+        )
+        alone = [wrapper.generate_batch(doc, torch.ones_like(doc), torch.ones_like(doc)) for doc in documents]
+    real = sum(lengths)
+    torch.testing.assert_close(
+        packed.target_hidden_states[:, :real],
+        torch.cat([batch.target_hidden_states for batch in alone], dim=1),
+        rtol=PARITY_TOL,
+        atol=PARITY_TOL,
+    )
+
+
 def test_generic_packing_mask_is_rejected_by_the_target(vlm_model):
     """Without the model-owned forward, the wrapper's additive block-causal mask cannot reach M3."""
     wrapper = HFDSparkTargetModel(vlm_model, target_layer_ids=[0, 2])
@@ -147,6 +182,49 @@ def test_packed_draft_blocks_match_the_document_alone(tmp_path, released, attn_i
             atol=PARITY_TOL,
             rtol=PARITY_TOL,
         )
+
+
+def test_packed_draft_rows_with_different_layouts():
+    """Each row of a two-row packed batch keeps its tested document's blocks equal to that document alone."""
+    draft = _build_minimax_m3_draft()
+    draft.num_anchors = 64
+    rows = ([9, 20, 11], [11, 20, 9])
+    generator = torch.Generator().manual_seed(4)
+    _, input_ids, position_ids, doc_remaining, seq_lens = _pack(rows, vocab_size=VOCAB - 1, generator=generator)
+    width = sum(rows[0])
+    features = torch.randn(2, width, len(TARGET_LAYER_IDS) * HIDDEN, generator=generator)
+    last_hidden = torch.randn(2, width, HIDDEN, generator=generator)
+    loss_mask = torch.ones(2, width)
+    for b, row in enumerate(rows):
+        loss_mask[b, : row[0]] = 0
+    with torch.no_grad():
+        packed = draft(
+            input_ids,
+            features,
+            loss_mask,
+            last_hidden,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
+            doc_remaining=doc_remaining,
+        )
+        for b, row in enumerate(rows):
+            start, end = row[0], row[0] + row[1]
+            alone = draft(
+                input_ids[b : b + 1, start:end],
+                features[b : b + 1, start:end],
+                loss_mask[b : b + 1, start:end],
+                last_hidden[b : b + 1, start:end],
+            )
+            kept = int(alone.block_keep_mask.sum())
+            eval_mask = alone.eval_mask[:, :kept]
+            assert eval_mask.any()
+            torch.testing.assert_close(packed.eval_mask[b : b + 1, :kept], eval_mask)
+            torch.testing.assert_close(
+                packed.draft_logits[b : b + 1, :kept][eval_mask],
+                alone.draft_logits[:, :kept][eval_mask],
+                atol=PARITY_TOL,
+                rtol=PARITY_TOL,
+            )
 
 
 def test_minimax_m3_draft_accepts_packing():
