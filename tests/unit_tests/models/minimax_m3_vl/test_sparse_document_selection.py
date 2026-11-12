@@ -20,18 +20,23 @@ also what MSA's document-local rule gives.
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
+import nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn as cp
 from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
+    packed_sparse_documents,
     select_document_sparse_blocks,
     select_sparse_blocks,
     sparse_document_layout,
 )
 from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch
 from tests.unit_tests.models.minimax_m3_vl._msa_select_reference import select_blocks_reference
-from tests.unit_tests.models.minimax_m3_vl.test_sparse_replay import _cpu_attention
+from tests.unit_tests.models.minimax_m3_vl.test_sparse_replay import _block, _cpu_attention
 
 LENGTHS = [13, 22, 9, 17]
+# Two equal-width rows with different layouts; the second row holds one document.
+ROWS = ([13, 22, 9, 17], [61])
 
 
 def _packed_inputs(lengths):
@@ -43,18 +48,27 @@ def _packed_inputs(lengths):
     return positions, keep[None, None]
 
 
-def test_packed_documents_match_each_document_alone(sparse_model):
+def _packed_rows(rows):
+    """Stack per-row position ids [B, T] and document keep-masks [B, 1, T, T]."""
+    inputs = [_packed_inputs(row) for row in rows]
+    return torch.cat([p for p, _ in inputs]), torch.cat([k for _, k in inputs])
+
+
+@pytest.mark.parametrize("rows", [(LENGTHS,), ROWS], ids=["one_row", "two_rows"])
+def test_packed_documents_match_each_document_alone(sparse_model, rows):
     """Every document of a packed row gets the hidden states it gets when it runs alone."""
     generator = torch.Generator().manual_seed(1)
-    docs = [torch.randint(0, 100, (n,), generator=generator) for n in LENGTHS]
-    positions, keep = _packed_inputs(LENGTHS)
+    docs = [[torch.randint(0, 100, (n,), generator=generator) for n in row] for row in rows]
+    positions, keep = _packed_rows(rows)
+    input_ids = torch.stack([torch.cat(row) for row in docs])
     with torch.no_grad():
-        packed = sparse_model.model(torch.cat(docs)[None], position_ids=positions, attention_mask=keep)
-        start = 0
-        for doc in docs:
-            alone = sparse_model.model(doc[None])
-            torch.testing.assert_close(packed[0, start : start + doc.numel()], alone[0], rtol=1e-5, atol=1e-5)
-            start += doc.numel()
+        packed = sparse_model.model(input_ids, position_ids=positions, attention_mask=keep)
+        for b, row in enumerate(docs):
+            start = 0
+            for doc in row:
+                alone = sparse_model.model(doc[None])
+                torch.testing.assert_close(packed[b, start : start + doc.numel()], alone[0], rtol=1e-5, atol=1e-5)
+                start += doc.numel()
 
 
 def test_local_sparse_path_selects_per_document(sparse_model, monkeypatch):
@@ -63,23 +77,71 @@ def test_local_sparse_path_selects_per_document(sparse_model, monkeypatch):
     attn = sparse_model.model.layers["1"].self_attn
     assert isinstance(attn, MiniMaxM3CPSparseAttention)
     generator = torch.Generator().manual_seed(2)
-    hidden = torch.randn(1, sum(LENGTHS), sparse_model.config.hidden_size, generator=generator)
-    positions, keep = _packed_inputs(LENGTHS)
+    hidden = torch.randn(len(ROWS), sum(ROWS[0]), sparse_model.config.hidden_size, generator=generator)
+    positions, keep = _packed_rows(ROWS)
     layout = sparse_document_layout(positions, block_size=attn.indexer.block_size)
     with torch.no_grad():
         freqs = sparse_model.model.make_freqs_cis(positions)
         packed = attn._local_sparse_forward(hidden, freqs_cis=freqs, attention_mask=keep, documents=layout)
         row_selected = attn._local_sparse_forward(hidden, freqs_cis=freqs, attention_mask=keep)
-        start, differs = 0, False
-        for n in LENGTHS:
-            doc = hidden[:, start : start + n]
-            alone = attn._local_sparse_forward(
-                doc, freqs_cis=sparse_model.model.make_freqs_cis(torch.arange(n)[None]), attention_mask=None
-            )
-            torch.testing.assert_close(packed[:, start : start + n], alone, rtol=1e-5, atol=1e-5)
-            differs |= not torch.allclose(row_selected[:, start : start + n], alone, rtol=1e-5, atol=1e-5)
-            start += n
+        differs = False
+        for b, row in enumerate(ROWS):
+            start = 0
+            for n in row:
+                doc = hidden[b : b + 1, start : start + n]
+                alone = attn._local_sparse_forward(
+                    doc, freqs_cis=sparse_model.model.make_freqs_cis(torch.arange(n)[None]), attention_mask=None
+                )
+                torch.testing.assert_close(packed[b : b + 1, start : start + n], alone, rtol=1e-5, atol=1e-5)
+                differs |= not torch.allclose(row_selected[b : b + 1, start : start + n], alone, rtol=1e-5, atol=1e-5)
+                start += n
     assert differs
+
+
+def _cpu_packed_forward(
+    self: MiniMaxM3CPSparseAttention,
+    x: torch.Tensor,
+    *,
+    freqs_cis: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    padding_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Enter the local path on CPU the way the CUDA dispatch does for a packed batch."""
+    documents = packed_sparse_documents(attention_mask, position_ids, padding_mask, block_size=self.indexer.block_size)
+    return self._local_sparse_forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, documents=documents)
+
+
+def test_checkpoint_recompute_replays_document_selection(monkeypatch):
+    """Activation checkpointing replays the per-document selection and matches gradients."""
+    monkeypatch.setattr(MiniMaxM3CPSparseAttention, "forward", _cpu_packed_forward)
+    monkeypatch.setattr(MiniMaxM3CPSparseAttention, "_flex_sparse_attention", _cpu_attention)
+    calls = []
+    original = cp.select_document_sparse_blocks
+
+    def count(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cp, "select_document_sparse_blocks", count)
+    torch.manual_seed(5)
+    block = _block()
+    lengths = [7, 10]
+    positions, keep = _packed_inputs(lengths)
+    angles = positions[0, :, None].float() / (10000 ** (torch.arange(0, 8, 2) / 8))
+    freqs = torch.cat((angles.cos(), angles.sin()), -1).unsqueeze(0)
+    x = torch.randn(1, sum(lengths), 32, requires_grad=True)
+    xr = x.detach().clone().requires_grad_()
+    kwargs = dict(freqs_cis=freqs, attention_mask=keep, position_ids=positions)
+    expected = block(xr, **kwargs)
+    assert len(calls) == 1
+    actual = checkpoint(block, x, use_reentrant=False, context_fn=block.nemo_checkpoint_context_fn(None), **kwargs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    weight = torch.randn_like(actual)
+    (actual * weight).sum().backward()
+    (expected * weight).sum().backward()
+    assert len(calls) == 2, "the recompute must replay the recorded selection"
+    torch.testing.assert_close(x.grad, xr.grad, rtol=2e-5, atol=2e-6)
 
 
 @pytest.mark.parametrize("score_type", ["max", "lse"])
@@ -146,9 +208,24 @@ def test_layout_aligns_documents_and_skips_padding():
     assert layout.key_rows[0].tolist() == [0, 1, 2, 3, 4, 8, 9, 12, 13, 14, 15, 16, 17]
     assert layout.first_blocks[0].tolist() == [0] * 5 + [2] * 2 + [3] * 6
     assert layout.num_blocks == 5
-    # Without a padding mask, repeated zeros still open only one document.
+    # Without a padding mask, a run of zeros opens one document.
     unmasked = sparse_document_layout(positions.clone(), block_size=4)
     assert unmasked.key_rows[0].tolist() == [0, 1, 2, 3, 4, 8, 9, 12, 13, 14, 16, 17, 18]
+    # With one, a one-token document is a document of its own.
+    single = sparse_document_layout(
+        torch.tensor([[0, 1, 2, 0, 0, 1, 2]]), block_size=4, padding_mask=torch.zeros(1, 7, dtype=torch.bool)
+    )
+    assert single.key_rows[0].tolist() == [0, 1, 2, 4, 8, 9, 10]
+    assert single.first_blocks[0].tolist() == [0, 0, 0, 1, 2, 2, 2]
+
+
+def test_layout_memo_follows_in_place_updates():
+    """A position tensor rewritten in place gets a new layout."""
+    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    first = sparse_document_layout(positions, block_size=4)
+    assert sparse_document_layout(positions, block_size=4) is first
+    positions.copy_(torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]))
+    assert sparse_document_layout(positions, block_size=4).key_rows[0].tolist() == [0, 1, 2, 4, 5, 6, 7, 8]
 
 
 def test_single_document_rows_keep_the_row_layout():

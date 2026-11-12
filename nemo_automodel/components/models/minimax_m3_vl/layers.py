@@ -345,7 +345,7 @@ class SparseDocumentLayout:
         return self.key_rows // self.block_size
 
 
-_DOCUMENT_LAYOUTS: WeakIdKeyDictionary = WeakIdKeyDictionary()
+_DOCUMENT_LAYOUTS: WeakIdKeyDictionary = WeakIdKeyDictionary()  # position_ids -> (version, {block_size: layout})
 
 
 @torch.no_grad()
@@ -358,11 +358,12 @@ def sparse_document_layout(
 ) -> SparseDocumentLayout | None:
     """Lay out the packed documents of a batch, found where ``position_ids`` resets to 0.
 
-    Padding tokens and repeated zeros (collators pad ``position_ids`` with 0) do not open
-    a document; they stay in the document before them, where causality and the caller's
-    mask already hide them. The result is memoized on the ``position_ids`` tensor, which
-    every layer of a forward and its recompute share; building it reads the workspace
-    size back to the host once.
+    Padding tokens do not open a document; they stay in the document before them, where
+    causality and the caller's mask already hide them. Collators pad ``position_ids``
+    with 0, so without ``padding_mask`` a run of zeros opens one document only. The
+    result is memoized on the ``position_ids`` tensor and its version, which every layer
+    of a forward and its recompute share, and assumes ``padding_mask`` is fixed for that
+    tensor; building it reads the workspace size back to the host once.
 
     Args:
         position_ids: Long tensor of shape [batch, keys], [keys], or [3, batch, keys]
@@ -381,8 +382,8 @@ def sparse_document_layout(
         return None
     memo_key = position_ids if memo_key is None else memo_key
     cached = _DOCUMENT_LAYOUTS.get(memo_key)
-    if cached is not None and block_size in cached:
-        return cached[block_size]
+    if cached is not None and cached[0] == memo_key._version and block_size in cached[1]:
+        return cached[1][block_size]
     positions = position_ids[0] if position_ids.dim() == 3 else position_ids
     if positions.dim() == 1:
         positions = positions.unsqueeze(0)
@@ -390,9 +391,10 @@ def sparse_document_layout(
     length = positions.shape[-1]
     slots = torch.arange(length, device=positions.device)
     starts = positions == 0
-    starts[:, 1:] &= positions[:, :-1] != 0
     if padding_mask is not None:
         starts = starts & ~padding_mask.to(device=positions.device, dtype=torch.bool).reshape(-1, length)
+    else:
+        starts[:, 1:] &= positions[:, :-1] != 0
     starts[:, 0] = True
     start_slots = torch.where(starts, slots, 0).cummax(dim=-1).values
     previous_starts = torch.cat([start_slots[:, :1], start_slots[:, :-1]], dim=-1)
@@ -409,7 +411,10 @@ def sparse_document_layout(
             block_size=block_size,
             num_blocks=last_row // block_size + 1,
         )
-    _DOCUMENT_LAYOUTS.setdefault(memo_key, {})[block_size] = layout
+    if cached is None or cached[0] != memo_key._version:
+        cached = (memo_key._version, {})
+        _DOCUMENT_LAYOUTS[memo_key] = cached
+    cached[1][block_size] = layout
     return layout
 
 
