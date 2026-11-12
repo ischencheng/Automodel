@@ -377,8 +377,9 @@ def test_local_flex_forward_backward(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_local_flex_packed_documents_match_each_document_alone(dtype: torch.dtype) -> None:
-    """A packed row (document keep-mask and per-document positions) gives every document the output
-    and input gradient it gets alone; selection stays inside the document."""
+    """Packed rows (document keep-mask and per-document positions) give every document the output
+    and input gradient it gets alone; selection stays inside the document. The second row holds
+    one document, so the rows have different layouts."""
     torch._dynamo.reset()
     torch.manual_seed(7)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -408,25 +409,31 @@ def test_local_flex_packed_documents_match_each_document_alone(dtype: torch.dtyp
 
     def freqs_for(positions: torch.Tensor) -> torch.Tensor:
         exponent = torch.arange(0, cfg.rotary_dim, 2, device="cuda") / cfg.rotary_dim
-        angles = positions[0, :, None].float() / (10000**exponent)
-        return torch.cat((angles.cos(), angles.sin()), -1).unsqueeze(0)
+        angles = positions[..., None].float() / (10000**exponent)
+        return torch.cat((angles.cos(), angles.sin()), -1)
 
-    lengths = [300, 517, 260, 450]
-    positions = torch.cat([torch.arange(n, device="cuda") for n in lengths])[None]
-    documents = torch.cat([torch.full((n,), i, device="cuda") for i, n in enumerate(lengths)])
-    causal = torch.ones(len(documents), len(documents), dtype=torch.bool, device="cuda").tril()
-    keep = ((documents[:, None] == documents[None, :]) & causal)[None, None]
-    x = torch.randn(1, sum(lengths), cfg.hidden_size, device="cuda", dtype=dtype, requires_grad=True)
+    rows = ([300, 517, 260, 450], [1527])
+    length = sum(rows[0])
+    positions = torch.stack([torch.cat([torch.arange(n, device="cuda") for n in row]) for row in rows])
+    documents = torch.stack(
+        [torch.cat([torch.full((n,), i, device="cuda") for i, n in enumerate(row)]) for row in rows]
+    )
+    causal = torch.ones(length, length, dtype=torch.bool, device="cuda").tril()
+    keep = ((documents[:, :, None] == documents[:, None, :]) & causal)[:, None]
+    x = torch.randn(len(rows), length, cfg.hidden_size, device="cuda", dtype=dtype, requires_grad=True)
     packed = attn(x, freqs_cis=freqs_for(positions), attention_mask=keep, position_ids=positions)
     gradient = torch.randn_like(packed)
     packed.backward(gradient)
     tolerance = 3e-5 if dtype == torch.float32 else 0.02
-    start = 0
-    for n in lengths:
-        doc = x.detach()[:, start : start + n].clone().requires_grad_()
-        doc_positions = torch.arange(n, device="cuda")[None]
-        alone = attn(doc, freqs_cis=freqs_for(doc_positions), position_ids=doc_positions)
-        alone.backward(gradient[:, start : start + n])
-        torch.testing.assert_close(packed[:, start : start + n], alone, rtol=tolerance, atol=tolerance)
-        torch.testing.assert_close(x.grad[:, start : start + n], doc.grad, rtol=2 * tolerance, atol=2 * tolerance)
-        start += n
+    for b, row in enumerate(rows):
+        start = 0
+        for n in row:
+            doc = x.detach()[b : b + 1, start : start + n].clone().requires_grad_()
+            doc_positions = torch.arange(n, device="cuda")[None]
+            alone = attn(doc, freqs_cis=freqs_for(doc_positions), position_ids=doc_positions)
+            alone.backward(gradient[b : b + 1, start : start + n])
+            torch.testing.assert_close(packed[b : b + 1, start : start + n], alone, rtol=tolerance, atol=tolerance)
+            torch.testing.assert_close(
+                x.grad[b : b + 1, start : start + n], doc.grad, rtol=2 * tolerance, atol=2 * tolerance
+            )
+            start += n
