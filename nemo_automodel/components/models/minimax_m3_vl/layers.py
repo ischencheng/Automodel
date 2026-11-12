@@ -37,6 +37,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils._python_dispatch import _disable_current_modes
 from torch.utils.weak import WeakIdKeyDictionary
 
 from nemo_automodel.components.attention.utils import (
@@ -348,7 +349,6 @@ class SparseDocumentLayout:
 _DOCUMENT_LAYOUTS: WeakIdKeyDictionary = WeakIdKeyDictionary()  # position_ids -> (version, {block_size: layout})
 
 
-@torch.no_grad()
 def sparse_document_layout(
     position_ids: torch.Tensor | None,
     *,
@@ -384,33 +384,37 @@ def sparse_document_layout(
     cached = _DOCUMENT_LAYOUTS.get(memo_key)
     if cached is not None and cached[0] == memo_key._version and block_size in cached[1]:
         return cached[1][block_size]
-    positions = position_ids[0] if position_ids.dim() == 3 else position_ids
-    if positions.dim() == 1:
-        positions = positions.unsqueeze(0)
-    positions = positions.to(torch.long)
-    length = positions.shape[-1]
-    slots = torch.arange(length, device=positions.device)
-    starts = positions == 0
-    if padding_mask is not None:
-        starts = starts & ~padding_mask.to(device=positions.device, dtype=torch.bool).reshape(-1, length)
-    else:
-        starts[:, 1:] &= positions[:, :-1] != 0
-    starts[:, 0] = True
-    start_slots = torch.where(starts, slots, 0).cummax(dim=-1).values
-    previous_starts = torch.cat([start_slots[:, :1], start_slots[:, :-1]], dim=-1)
-    # A document ending off a block boundary leaves the rest of its last block empty.
-    gaps = torch.where(starts, (previous_starts - slots) % block_size, 0)
-    key_rows = slots + gaps.cumsum(dim=-1)
-    first_blocks = (key_rows - (slots - start_slots)) // block_size
-    documents, last_row = torch.stack([starts.sum(dim=-1).amax(), key_rows[:, -1].amax()]).tolist()
-    layout = None
-    if documents > 1:
-        layout = SparseDocumentLayout(
-            key_rows=key_rows,
-            first_blocks=first_blocks,
-            block_size=block_size,
-            num_blocks=last_row // block_size + 1,
-        )
+    # Build outside any dispatch mode: on a memo miss inside a selective-checkpoint region the
+    # one-time ops (the host read especially) would be saved but never replayed by the recompute,
+    # shifting the block's later saved ops.
+    with torch.no_grad(), _disable_current_modes():
+        positions = position_ids[0] if position_ids.dim() == 3 else position_ids
+        if positions.dim() == 1:
+            positions = positions.unsqueeze(0)
+        positions = positions.to(torch.long)
+        length = positions.shape[-1]
+        slots = torch.arange(length, device=positions.device)
+        starts = positions == 0
+        if padding_mask is not None:
+            starts = starts & ~padding_mask.to(device=positions.device, dtype=torch.bool).reshape(-1, length)
+        else:
+            starts[:, 1:] &= positions[:, :-1] != 0
+        starts[:, 0] = True
+        start_slots = torch.where(starts, slots, 0).cummax(dim=-1).values
+        previous_starts = torch.cat([start_slots[:, :1], start_slots[:, :-1]], dim=-1)
+        # A document ending off a block boundary leaves the rest of its last block empty.
+        gaps = torch.where(starts, (previous_starts - slots) % block_size, 0)
+        key_rows = slots + gaps.cumsum(dim=-1)
+        first_blocks = (key_rows - (slots - start_slots)) // block_size
+        documents, last_row = torch.stack([starts.sum(dim=-1).amax(), key_rows[:, -1].amax()]).tolist()
+        layout = None
+        if documents > 1:
+            layout = SparseDocumentLayout(
+                key_rows=key_rows,
+                first_blocks=first_blocks,
+                block_size=block_size,
+                num_blocks=last_row // block_size + 1,
+            )
     if cached is None or cached[0] != memo_key._version:
         cached = (memo_key._version, {})
         _DOCUMENT_LAYOUTS[memo_key] = cached

@@ -20,6 +20,7 @@ also what MSA's document-local rule gives.
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
 import nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn as cp
@@ -237,6 +238,23 @@ def test_layout_aligns_documents_and_skips_padding():
     )
     assert single.key_rows[0].tolist() == [0, 1, 2, 4, 8, 9, 10]
     assert single.first_blocks[0].tolist() == [0, 0, 0, 1, 2, 2, 2]
+
+
+def test_layout_is_built_outside_dispatch_modes():
+    """Selective checkpointing never sees the one-time layout ops (on CUDA, a saved host copy), so a
+    recompute that finds the memo replays the block's other saved ops in order."""
+    seen = []
+
+    class Record(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            seen.append(func)
+            return func(*args, **(kwargs or {}))
+
+    positions = torch.tensor([[0, 1, 2, 0, 1, 2, 3]])
+    with Record():
+        layout = sparse_document_layout(positions, block_size=4)
+    assert layout is not None
+    assert seen == []
 
 
 def test_layout_memo_follows_in_place_updates():
