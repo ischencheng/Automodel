@@ -473,7 +473,9 @@ def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():
 _INFRA_MODULE = "nemo_automodel._transformers.infrastructure"
 
 
-def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wrapper=None, model=None):
+def _run_apply_model_infrastructure(
+    *, is_meta_device, load_base_model, model_wrapper=None, model=None, autopipeline=None, checkpoint_path=None
+):
     """Helper that invokes apply_model_infrastructure with heavy dependencies stubbed out."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
@@ -496,7 +498,10 @@ def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wr
             device=torch.device("cpu"),
             load_base_model=load_base_model,
             model_wrapper=model_wrapper,
-            pretrained_model_name_or_path="test/model" if load_base_model else "",
+            autopipeline=autopipeline,
+            pretrained_model_name_or_path=(
+                checkpoint_path if checkpoint_path is not None else ("test/model" if load_base_model else "")
+            ),
         )
 
         return result, mock_ckpt
@@ -627,6 +632,24 @@ class TestApplyModelInfrastructurePostShardInit:
 
         mock_ckpt.initialize_model_weights.assert_called_once()
         assert model._skip_init_weights_on_load is load_base_model
+
+    @pytest.mark.parametrize("checkpoint_path", ["test/model", ""])
+    def test_pipeline_skips_init_only_before_a_checkpoint_load(self, checkpoint_path):
+        """With PP and load_base_model=True, init is skipped only when a checkpoint path is loaded."""
+        model = _DummyModel()
+        model.parts = [model]
+        with patch(f"{_INFRA_MODULE}._shard_pp", side_effect=lambda pipeline, m, *args: m):
+            _, mock_ckpt = _run_apply_model_infrastructure(
+                is_meta_device=True,
+                load_base_model=True,
+                model=model,
+                autopipeline=MagicMock(),
+                checkpoint_path=checkpoint_path,
+            )
+
+        mock_ckpt.initialize_model_weights.assert_called_once()
+        assert mock_ckpt.load_base_model.called is bool(checkpoint_path)
+        assert model._skip_init_weights_on_load is bool(checkpoint_path)
 
     def test_non_meta_skips_initialize_model_weights(self):
         """Non-meta device model should not call initialize_model_weights."""

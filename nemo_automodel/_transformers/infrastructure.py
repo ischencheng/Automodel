@@ -871,7 +871,7 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
-            if autopipeline is not None and load_base_model:
+            if autopipeline is not None and need_checkpoint_load:
                 # PP stages own different modules, so HF random initialization can issue
                 # a different number of DTensor RNG collectives on each stage. Every
                 # parameter is about to be populated from the pretrained checkpoint.
