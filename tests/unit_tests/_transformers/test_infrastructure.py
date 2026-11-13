@@ -473,11 +473,11 @@ def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():
 _INFRA_MODULE = "nemo_automodel._transformers.infrastructure"
 
 
-def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wrapper=None):
+def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wrapper=None, model=None):
     """Helper that invokes apply_model_infrastructure with heavy dependencies stubbed out."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
-    model = _DummyModel()
+    model = _DummyModel() if model is None else model
 
     with (
         patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
@@ -612,6 +612,21 @@ class TestApplyModelInfrastructurePostShardInit:
 
         mock_ckpt.initialize_model_weights.assert_called_once()
         mock_ckpt.load_base_model.assert_called_once()
+
+    @pytest.mark.parametrize("load_base_model", [False, True])
+    def test_class_init_skip_applies_only_before_a_checkpoint_load(self, load_base_model):
+        """A class that skips random init before its own load is initialized when nothing is loaded."""
+
+        class _SkipsInitBeforeLoad(_DummyModel):
+            _skip_init_weights_on_load = True
+
+        model = _SkipsInitBeforeLoad()
+        _, mock_ckpt = _run_apply_model_infrastructure(
+            is_meta_device=True, load_base_model=load_base_model, model=model
+        )
+
+        mock_ckpt.initialize_model_weights.assert_called_once()
+        assert model._skip_init_weights_on_load is load_base_model
 
     def test_non_meta_skips_initialize_model_weights(self):
         """Non-meta device model should not call initialize_model_weights."""

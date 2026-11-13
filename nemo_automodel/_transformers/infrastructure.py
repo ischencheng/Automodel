@@ -876,6 +876,10 @@ def apply_model_infrastructure(
                 # a different number of DTensor RNG collectives on each stage. Every
                 # parameter is about to be populated from the pretrained checkpoint.
                 mp._skip_init_weights_on_load = True
+            elif not need_checkpoint_load:
+                # No checkpoint overwrites these parameters (from_config, or load_base_model=False).
+                # A model class that skips random init before its own checkpoint load still needs it here.
+                mp._skip_init_weights_on_load = False
             checkpointer.initialize_model_weights(mp, init_device, peft_init_method=lora_a_init)
 
     # Load the checkpoint if pretrained weights are needed and weren't already loaded
