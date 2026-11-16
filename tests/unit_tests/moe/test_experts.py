@@ -768,6 +768,70 @@ class TestGroupedExperts:
         except Exception as e:
             pytest.fail(f"GPU execution failed: {e}")
 
+    @pytest.mark.parametrize("expert_bias", [False, True])
+    def test_loop_backward_builds_each_stacked_gradient_once(self, moe_config, expert_bias):
+        """The loop path writes each stacked expert gradient once and matches per-expert autograd."""
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        config = replace(
+            moe_config, n_routed_experts=4, dim=16, moe_inter_dim=6, expert_bias=expert_bias, dtype=torch.float32
+        )
+        experts = GroupedExperts(config)
+        torch.manual_seed(11)
+        with torch.no_grad():
+            for param in experts.parameters():
+                param.copy_(torch.randn_like(param) * 0.2)
+        stacked = dict(experts.named_parameters())
+        stacked_shapes = {param.shape: name for name, param in stacked.items()}
+        assert len(stacked_shapes) == len(stacked)
+
+        num_tokens = 10
+        x = torch.randn(num_tokens, config.dim, requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool)
+        token_mask[-1] = False
+        weights = torch.rand(num_tokens, config.n_activated_experts)
+        # Imbalanced routing: experts 0-2 take 8, 5 and 5 tokens and expert 3 none, so no
+        # per-expert activation shares a shape with a stacked parameter.
+        indices = torch.tensor([[0, 1], [0, 2], [0, 1], [1, 0], [0, 2], [2, 0], [0, 1], [1, 2], [0, 2], [3, 0]])
+
+        class CountStackedSizeResults(TorchDispatchMode):
+            def __init__(self) -> None:
+                super().__init__()
+                self.counts = dict.fromkeys(stacked, 0)
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                if not func.is_view and isinstance(out, torch.Tensor) and out.shape in stacked_shapes:
+                    self.counts[stacked_shapes[out.shape]] += 1
+                return out
+
+        y = experts(x, token_mask, weights, indices)
+        upstream = torch.randn_like(y)
+        with CountStackedSizeResults() as mode:
+            y.backward(upstream)
+        assert mode.counts == dict.fromkeys(stacked, 1)
+
+        per_expert = {name: [p.detach().clone().requires_grad_(True) for p in param] for name, param in stacked.items()}
+        expected = torch.zeros(num_tokens, config.dim)
+        for e in range(3):
+            idx, top = torch.where((indices == e) & token_mask[:, None])
+            w = weights[idx, top, None]
+            h = x[idx] @ per_expert["gate_and_up_projs"][e]
+            if expert_bias:
+                h = h + per_expert["gate_up_proj_bias"][e]
+            out = experts.expert_activation_grouped(h, w) @ per_expert["down_projs"][e]
+            if expert_bias:
+                out = out + per_expert["down_proj_bias"][e] * w
+            expected = expected.index_add(0, idx, out)
+        torch.testing.assert_close(y, expected)
+        leaves = [p for name in stacked for p in per_expert[name]]
+        expected_grads = torch.autograd.grad(expected, leaves, upstream, allow_unused=True)
+        expected_grads = iter(expected_grads)
+        for name, param in stacked.items():
+            for e in range(config.n_routed_experts):
+                grad = next(expected_grads)
+                torch.testing.assert_close(param.grad[e], torch.zeros_like(param[e]) if grad is None else grad)
+
 
 class TestGroupedExpertsForwardLoopDTensorBias:
     """Test that _forward_loop correctly handles DTensor biases.

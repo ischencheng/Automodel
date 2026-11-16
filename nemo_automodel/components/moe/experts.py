@@ -1011,6 +1011,14 @@ class GroupedExperts(TransposedMatrixModule, nn.Module):
         )
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
+        # Unbind the stacked weights once. Indexing them per expert would make every
+        # expert's backward build and accumulate a gradient the size of the whole
+        # stack; the backward of one unbind stacks the per-expert gradients once.
+        gate_and_up_proj_list = gate_and_up_projs.unbind(0)
+        down_proj_list = down_projs.unbind(0)
+        gate_up_proj_bias_list = gate_up_proj_bias.unbind(0) if gate_up_proj_bias is not None else None
+        down_proj_bias_list = down_proj_bias.unbind(0) if down_proj_bias is not None else None
+
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
             indices_mask = torch.logical_and(indices == i, token_mask.unsqueeze(-1))
@@ -1021,14 +1029,14 @@ class GroupedExperts(TransposedMatrixModule, nn.Module):
             active_local_experts += 1
 
             local_idx = i - experts_start_idx
-            down_proj = down_projs[local_idx]
-            expert_down_proj_bias = down_proj_bias[local_idx] if down_proj_bias is not None else None
+            down_proj = down_proj_list[local_idx]
+            expert_down_proj_bias = down_proj_bias_list[local_idx] if down_proj_bias_list is not None else None
 
             idx_b = idx[:, None].expand(-1, x.size(1))
             x_idx = x.gather(dim=0, index=idx_b)
 
-            gate_and_up_proj = gate_and_up_projs[local_idx]
-            expert_gate_up_proj_bias = gate_up_proj_bias[local_idx] if gate_up_proj_bias is not None else None
+            gate_and_up_proj = gate_and_up_proj_list[local_idx]
+            expert_gate_up_proj_bias = gate_up_proj_bias_list[local_idx] if gate_up_proj_bias_list is not None else None
 
             # Up projection (separate from activation, matching DeepEP pattern)
             gate_and_up_out = x_idx @ gate_and_up_proj
@@ -1062,9 +1070,9 @@ class GroupedExperts(TransposedMatrixModule, nn.Module):
         # Dummy computation for gradient flow when no tokens routed locally
         if active_local_experts == 0:
             dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
-            gate_and_up_out = dummy_x @ gate_and_up_projs[0]
+            gate_and_up_out = dummy_x @ gate_and_up_proj_list[0]
             activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
-            expert_out = activated @ down_projs[0]
+            expert_out = activated @ down_proj_list[0]
             if post_expert_output is not None:
                 expert_out = post_expert_output(expert_out)
             if self.config.apply_router_weight_after_down:
