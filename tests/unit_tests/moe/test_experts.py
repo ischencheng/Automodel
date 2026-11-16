@@ -769,8 +769,8 @@ class TestGroupedExperts:
             pytest.fail(f"GPU execution failed: {e}")
 
     @pytest.mark.parametrize("expert_bias", [False, True])
-    def test_loop_backward_builds_each_stacked_gradient_once(self, moe_config, expert_bias):
-        """The loop path writes each stacked expert gradient once and matches per-expert autograd."""
+    def test_loop_backward_does_not_accumulate_stacked_gradients(self, moe_config, expert_bias):
+        """The loop path never sums per-expert gradients of full stack size, and matches per-expert autograd."""
         from torch.utils._python_dispatch import TorchDispatchMode
 
         config = replace(
@@ -797,19 +797,23 @@ class TestGroupedExperts:
         class CountStackedSizeResults(TorchDispatchMode):
             def __init__(self) -> None:
                 super().__init__()
-                self.counts = dict.fromkeys(stacked, 0)
+                self.ops = {name: [] for name in stacked}
 
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
                 out = func(*args, **(kwargs or {}))
                 if not func.is_view and isinstance(out, torch.Tensor) and out.shape in stacked_shapes:
-                    self.counts[stacked_shapes[out.shape]] += 1
+                    self.ops[stacked_shapes[out.shape]].append(str(func))
                 return out
 
         y = experts(x, token_mask, weights, indices)
         upstream = torch.randn_like(y)
         with CountStackedSizeResults() as mode:
             y.backward(upstream)
-        assert mode.counts == dict.fromkeys(stacked, 1)
+        # Each parameter's assembled gradient is one full-size result; allow one more in case AccumulateGrad
+        # clones it. Three routed experts that each produced a full-size gradient would need full-size adds.
+        for name, ops in mode.ops.items():
+            assert not [op for op in ops if op.startswith("aten.add")], (name, ops)
+            assert len(ops) <= 2, (name, ops)
 
         per_expert = {name: [p.detach().clone().requires_grad_(True) for p in param] for name, param in stacked.items()}
         expected = torch.zeros(num_tokens, config.dim)
